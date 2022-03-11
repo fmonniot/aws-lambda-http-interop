@@ -61,3 +61,73 @@ pub mod runtime {
         }
     }
 }
+
+pub mod http {
+
+    /// This is for reference only and is basically the lambda_http run signature.
+    pub async fn run_lambda_tower<'a, R, S>(handler: S) -> Result<(), lambda_http::Error>
+    where
+        S: tower::Service<lambda_http::Request, Response = R, Error = lambda_http::Error> + Send,
+        S::Future: Send + 'a,
+        R: lambda_http::IntoResponse,
+    {
+        lambda_http::run(handler).await
+    }
+
+    /// This is the signature for creating an actix-web server. The various factories are
+    /// probably there because the server is multi-threaded. We are keepin the same signature
+    /// to make interopability easier, even though most of the factory aren't required.
+    pub async fn run_lambda_actix<F, I, S, B>(factory: F) -> Result<(), lambda_http::Error>
+    where
+        F: Fn() -> I + Send + Clone + 'static,
+        I: actix_service::IntoServiceFactory<S, actix_http::Request>,
+        S: actix_service::ServiceFactory<actix_http::Request, Config = actix_web::dev::AppConfig>,
+        S::Error: Into<actix_web::Error>,
+        S::InitError: std::fmt::Debug,
+        S::Response: Into<actix_http::Response<B>>,
+        B: actix_web::body::MessageBody,
+    {
+        use actix_service::Service;
+
+        let sf = factory().into_factory();
+
+        let svc = sf
+            .new_service(actix_web::dev::AppConfig::default())
+            .await
+            .unwrap(); // TODO return instead of unwraping
+
+        let svc = std::sync::Arc::new(svc);
+
+        let t_svc = tower::service_fn(|req| {
+            let svc = svc.clone();
+            async move {
+                let actix_req = http_to_actix_request(req);
+
+                let r = svc.call(actix_req).await;
+
+                let r = match r {
+                    Ok(r) => actix_to_http_response(r.into()),
+                    Err(err) => {
+                        let e: actix_web::Error = err.into();
+
+                        actix_to_http_response(e.error_response().into())
+                    }
+                };
+
+                Ok(r)
+            }
+        });
+
+        lambda_http::run(t_svc).await
+    }
+
+    fn http_to_actix_request(req: lambda_http::Request) -> actix_http::Request {
+        todo!()
+    }
+
+    fn actix_to_http_response<B: actix_web::body::MessageBody>(
+        res: actix_http::Response<B>,
+    ) -> lambda_http::Response<lambda_http::Body> {
+        todo!()
+    }
+}

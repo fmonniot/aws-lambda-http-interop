@@ -7,7 +7,11 @@ edition = "2021"
 
 [dependencies]
 lambda_runtime = "0.5.0"
+#lambda_http = "0.5.1"
+lambda_http = { git = "https://github.com/fmonniot/aws-lambda-rust-runtime", branch = "relax-send-constraint" }
 actix-web = "4"
+actix-service = "2"
+actix-http = "3"
 tower = "0.3"
 serde = { version = "1", features = ["derive"] }
 
