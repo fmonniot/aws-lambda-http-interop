@@ -63,6 +63,8 @@ pub mod runtime {
 }
 
 pub mod http {
+    use actix_web::web::Bytes;
+    use actix_web::HttpMessage;
 
     /// This is for reference only and is basically the lambda_http run signature.
     pub async fn run_lambda_tower<'a, R, S>(handler: S) -> Result<(), lambda_http::Error>
@@ -121,8 +123,64 @@ pub mod http {
         lambda_http::run(t_svc).await
     }
 
+    // TODO Investigate if we cannot create a request using actix_http::Request directly
+    // instead of going through TestRequest
     fn http_to_actix_request(req: lambda_http::Request) -> actix_http::Request {
-        todo!()
+        let (
+            http::request::Parts {
+                method,
+                uri,
+                version,
+                headers,
+                mut extensions,
+                ..
+            },
+            body,
+        ) = req.into_parts();
+
+        // Create the actix request with correct uri, method and version.
+        // Unfortunately TestRequest doesn't expose any function to use a Uri
+        // as is, so we do have to go through a String. And actix will convert it
+        // back into an Uri :(.
+        let mut r = actix_web::test::TestRequest::default()
+            .uri(&uri.to_string())
+            .method(method)
+            .version(version);
+
+        for (n, v) in headers {
+            if let Some(n) = n {
+                r = r.append_header((n, v));
+            }
+        }
+
+
+        // Insert the body into the request
+        let b = match body {
+            lambda_http::Body::Empty => Bytes::default(),
+            lambda_http::Body::Text(s) => Bytes::from(s),
+            lambda_http::Body::Binary(b) => Bytes::from(b),
+        };
+        r = r.set_payload(b);
+
+        // Build the request as consumed by actix
+        let r = r.to_request();
+        let mut r_ext = r.extensions_mut();
+
+        // And finally set some extensions. We ignore the query/params/stage extensions as
+        // they should already be present in the uri.
+
+        if let Some(aws_context) = extensions.remove::<lambda_runtime::Context>() {
+            r_ext.insert(aws_context);
+        }
+
+        if let Some(req_context) = extensions.remove::<lambda_http::request::RequestContext>() {
+            r_ext.insert(req_context);
+        }
+
+        // We are done inserting extensions, release reference to r
+        drop(r_ext);
+
+        r
     }
 
     fn actix_to_http_response<B: actix_web::body::MessageBody>(
