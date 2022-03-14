@@ -123,8 +123,6 @@ pub mod http {
         lambda_http::run(t_svc).await
     }
 
-    // TODO Investigate if we cannot create a request using actix_http::Request directly
-    // instead of going through TestRequest
     fn http_to_actix_request(req: lambda_http::Request) -> actix_http::Request {
         let (
             http::request::Parts {
@@ -138,36 +136,35 @@ pub mod http {
             body,
         ) = req.into_parts();
 
-        // Create the actix request with correct uri, method and version.
-        // Unfortunately TestRequest doesn't expose any function to use a Uri
-        // as is, so we do have to go through a String. And actix will convert it
-        // back into an Uri :(.
-        let mut r = actix_web::test::TestRequest::default()
-            .uri(&uri.to_string())
-            .method(method)
-            .version(version);
+        use actix_http::{BoxedPayloadStream, Payload};
 
-        for (n, v) in headers {
-            if let Some(n) = n {
-                r = r.append_header((n, v));
-            }
-        }
+        // We start by transforming the lambda request body into an actix one.
+        let payload: Payload<BoxedPayloadStream> = {
+            let (_, mut payload) = actix_http::h1::Payload::create(true);
 
+            let b = match body {
+                lambda_http::Body::Empty => Bytes::default(),
+                lambda_http::Body::Text(s) => Bytes::from(s),
+                lambda_http::Body::Binary(b) => Bytes::from(b),
+            };
 
-        // Insert the body into the request
-        let b = match body {
-            lambda_http::Body::Empty => Bytes::default(),
-            lambda_http::Body::Text(s) => Bytes::from(s),
-            lambda_http::Body::Binary(b) => Bytes::from(b),
+            payload.unread_data(b);
+
+            payload.into()
         };
-        r = r.set_payload(b);
 
-        // Build the request as consumed by actix
-        let r = r.to_request();
-        let mut r_ext = r.extensions_mut();
+        // Then we move the Parts from http to actix
+        let mut actix_request = actix_http::Request::with_payload(payload);
+        let head = actix_request.head_mut();
+        head.method = method;
+        head.uri = uri;
+        head.version = version;
+        head.headers = headers.into();
 
         // And finally set some extensions. We ignore the query/params/stage extensions as
         // they should already be present in the uri.
+
+        let mut r_ext = actix_request.extensions_mut();
 
         if let Some(aws_context) = extensions.remove::<lambda_runtime::Context>() {
             r_ext.insert(aws_context);
@@ -177,10 +174,10 @@ pub mod http {
             r_ext.insert(req_context);
         }
 
-        // We are done inserting extensions, release reference to r
+        // We are done inserting extensions, release reference to it
         drop(r_ext);
 
-        r
+        actix_request
     }
 
     fn actix_to_http_response<B: actix_web::body::MessageBody>(
