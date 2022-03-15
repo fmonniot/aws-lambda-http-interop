@@ -65,6 +65,7 @@ pub mod runtime {
 pub mod http {
     use actix_web::web::Bytes;
     use actix_web::HttpMessage;
+    use lambda_http::Body;
 
     /// This is for reference only and is basically the lambda_http run signature.
     pub async fn run_lambda_tower<'a, R, S>(handler: S) -> Result<(), lambda_http::Error>
@@ -183,6 +184,44 @@ pub mod http {
     fn actix_to_http_response<B: actix_web::body::MessageBody>(
         res: actix_http::Response<B>,
     ) -> lambda_http::Response<lambda_http::Body> {
-        todo!()
+        // The ResponseHead/Parts is gonna be relatively simple
+        // The body is going to be way more interesting, mostly
+        // because actix MessageBody can be a Stream.
+        // Perhaps let the stream on the side for a first pass
+        // and come back to it later down the road ?
+        // Do note that AWS lambda do not support chunked/stream
+        // responses, so we could accumulate the content of the
+        // stream in memory to build the correct lambda_http::Body
+
+        let (head, body) = res.into_parts();
+
+        let mut builder = lambda_http::Response::builder().status(head.status());
+
+        // TODO Consider using head.headers_mut().drain() to avoid cloning the headers
+        for (name, value) in head.headers() {
+            builder = builder.header(name, value);
+        }
+
+        let b = match body.size() {
+            actix_http::body::BodySize::None => Body::Empty,
+            _ => {
+                // TODO Do we need to set the correct Content-Length header ?
+
+                match body.try_into_bytes() {
+                    Ok(bytes) => {
+                        // TODO how do we decide between Body::String and Body::Binary ?
+                        Body::Binary(bytes.to_vec())
+                    }
+                    Err(_body) => {
+                        // TODO poll the body and accumulate its content here
+                        todo!("We do not support streamed response yet")
+                    }
+                }
+            }
+        };
+
+        builder
+            .body(b)
+            .expect("actix to http response conversion should not fail")
     }
 }
