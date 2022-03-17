@@ -1,3 +1,5 @@
+pub mod hyper;
+
 /// Interop for the basic lambda event, without any HTTP layer shim.
 /// I don't think there is much value here to be honest, because I'm
 /// ready to bet that most of the actix ecosystem is around actix-http
