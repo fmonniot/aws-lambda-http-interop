@@ -1,20 +1,35 @@
 use actix_web::web::Bytes;
 use actix_web::HttpMessage;
 use lambda_http::Body;
+use std::future::Future;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 
-// TODO Return a proper type instead of an impl
-// And then impl Send with the proper bound. Let's try it this way and see
-// if we can make the hyper server happy.
-pub async fn as_service<'a, F, I, S, B>(
-    factory: F,
-) -> Result<
-    impl tower::Service<
-            lambda_http::Request,
-            Response = lambda_http::Response<lambda_http::Body>,
-            Error = lambda_http::Error,
-        > + 'a,
-    lambda_http::Error,
->
+pub async fn run<F, I, S, B>(factory: F) -> Result<(), lambda_http::Error>
+where
+    F: Fn() -> I + Send + Clone + 'static,
+    I: actix_service::IntoServiceFactory<S, actix_http::Request>,
+    S: actix_service::ServiceFactory<actix_http::Request, Config = actix_web::dev::AppConfig>,
+    S::Error: Into<actix_web::Error>,
+    S::InitError: std::fmt::Debug,
+    S::Response: Into<actix_http::Response<B>>,
+    B: actix_web::body::MessageBody + Unpin,
+{
+    lambda_http::run(service(factory).await).await
+}
+
+pub struct ActixTowerService<'a, S, B>
+where
+    S: actix_service::Service<actix_http::Request> + 'a,
+{
+    service: Arc<S>,
+    _phantom_b: PhantomData<B>,
+    _phantom_a: PhantomData<&'a ()>,
+}
+
+pub async fn service<'a, F, I, S, B>(factory: F) -> ActixTowerService<'a, S::Service, B>
 where
     F: Fn() -> I + Send + Clone + 'static,
     I: actix_service::IntoServiceFactory<S, actix_http::Request>,
@@ -25,54 +40,86 @@ where
     S::Service: 'a,
     B: actix_web::body::MessageBody,
 {
-    use actix_service::Service;
-
     let sf = factory().into_factory();
 
-    let svc = sf
+    let service = sf
         .new_service(actix_web::dev::AppConfig::default())
         .await
         .unwrap(); // TODO return instead of unwraping
 
-    let svc = std::sync::Arc::new(svc);
+    let service = std::sync::Arc::new(service);
 
-    let t_svc = tower::service_fn(move |req| {
-        let svc = svc.clone();
-        async move {
-            let actix_req = http_to_actix_request(req);
-
-            let r = svc.call(actix_req).await;
-
-            let r = match r {
-                Ok(r) => actix_to_http_response(r.into()),
-                Err(err) => {
-                    let e: actix_web::Error = err.into();
-
-                    actix_to_http_response(e.error_response().into())
-                }
-            };
-
-            Ok(r)
-        }
-    });
-
-    Ok(t_svc)
+    ActixTowerService {
+        service,
+        _phantom_a: PhantomData,
+        _phantom_b: PhantomData,
+    }
 }
 
-/// This is the signature for creating an actix-web server. The various factories are
-/// probably there because the server is multi-threaded. We are keepin the same signature
-/// to make interopability easier, even though most of the factory aren't required.
-pub async fn run<F, I, S, B>(factory: F) -> Result<(), lambda_http::Error>
+impl<'a, S, B> tower::Service<lambda_http::Request> for ActixTowerService<'a, S, B>
 where
-    F: Fn() -> I + Send + Clone + 'static,
-    I: actix_service::IntoServiceFactory<S, actix_http::Request>,
-    S: actix_service::ServiceFactory<actix_http::Request, Config = actix_web::dev::AppConfig>,
-    S::Error: Into<actix_web::Error>,
-    S::InitError: std::fmt::Debug,
+    S: actix_service::Service<actix_http::Request> + 'a,
     S::Response: Into<actix_http::Response<B>>,
-    B: actix_web::body::MessageBody,
+    S::Error: Into<actix_web::Error>,
+    B: actix_web::body::MessageBody + Unpin,
 {
-    lambda_http::run(as_service(factory).await?).await
+    type Response = lambda_http::Response<lambda_http::Body>;
+    type Error = lambda_http::Error;
+
+    type Future = TransformResponse<'a, S::Response, B, S::Error>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: lambda_http::Request) -> Self::Future {
+        let actix_req = http_to_actix_request(req);
+        let fut = Box::pin(self.service.call(actix_req));
+
+        TransformResponse {
+            fut,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+/// Future that will convert an [`actix_http::Response`] into an actual [`lambda_http::Response`]
+///
+/// This is used by the `ActixTowerService` wrapper and is completely internal to the `service` function.
+#[doc(hidden)]
+pub struct TransformResponse<'a, R, B, E> {
+    fut: Pin<Box<dyn Future<Output = Result<R, E>> + 'a>>,
+    _phantom: PhantomData<B>,
+}
+
+impl<'a, R, E, B> Future for TransformResponse<'a, R, B, E>
+where
+    R: Into<actix_http::Response<B>>,
+    E: Into<actix_web::Error>,
+    B: actix_web::body::MessageBody + Unpin,
+{
+    type Output = Result<lambda_http::Response<lambda_http::Body>, lambda_http::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext) -> Poll<Self::Output> {
+        match self.fut.as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                let r = match result {
+                    Ok(r) => actix_to_http_response(r.into()),
+                    Err(err) => {
+                        let e: actix_web::Error = err.into();
+
+                        actix_to_http_response(e.error_response().into())
+                    }
+                };
+
+                Poll::Ready(Ok(r))
+            }
+        }
+    }
 }
 
 fn http_to_actix_request(req: lambda_http::Request) -> actix_http::Request {
