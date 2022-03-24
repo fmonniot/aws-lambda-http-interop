@@ -12,6 +12,7 @@ lambda_http = { git = "https://github.com/fmonniot/aws-lambda-rust-runtime", bra
 actix-web = "4"
 actix-service = "2"
 actix-http = "3"
+axum = "0.4"
 tower = "0.3"
 serde = { version = "1", features = ["derive"] }
 http = "0.2"

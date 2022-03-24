@@ -1,4 +1,5 @@
 pub mod actix;
+pub mod axum;
 pub mod hyper;
 
 /// Interop for the basic lambda event, without any HTTP layer shim.
