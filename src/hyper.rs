@@ -1,6 +1,5 @@
-use hyper::service::{make_service_fn, service_fn};
+use hyper::server::conn::AddrIncoming;
 use hyper::{Request, Response, Server};
-use std::convert::Infallible;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
@@ -9,78 +8,41 @@ use std::task::{Context as TaskContext, Poll};
 use tower::Service;
 
 // Should this return a Server instead ? Will I be able to make it work with the generics ?
-pub async fn run<'a, F, Fut, R, S>(factory: F) -> Result<(), hyper::Error>
+pub async fn serve<'a, F, Fut, R, S, MkErr>(
+    factory: F,
+) -> hyper::Server<AddrIncoming, MakeLambdaService<'a, F>>
 where
     F: Fn() -> Fut + Send + Clone + 'static,
-    Fut: Future<Output = S> + Send,
+    Fut: Future<Output = Result<S, MkErr>> + Send + 'static,
     S: tower::Service<lambda_http::Request, Response = R, Error = lambda_http::Error>
         + Send
         + 'static,
     S::Future: Send + 'a,
-    R: lambda_http::IntoResponse,
+    R: lambda_http::IntoResponse + 'static,
+    MkErr: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
 {
     // We'll bind to 127.0.0.1:3000
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
 
     let make = MakeLambdaService {
         factory: factory.clone(),
+        _phantom: PhantomData,
     };
 
-    // A `Service` is needed for every connection, so this
-    // creates one from our `hello_world` function.
-    let make_svc = make_service_fn(move |_conn| {
-        let factory = factory.clone();
-
-        async move {
-            // service_fn converts our function into a `Service`
-            Ok::<_, Infallible>(service_fn(move |req: Request<hyper::Body>| {
-                let factory = factory.clone();
-                async move {
-                    let factory = factory();
-                    let mut handler = factory.await;
-                    let (parts, body) = req.into_parts();
-                    let body = hyper::body::to_bytes(body).await?;
-                    let body = lambda_http::Body::Binary(body.to_vec());
-                    let lambda_http_req = Request::from_parts(parts, body);
-
-                    let (parts, body) = handler
-                        .call(lambda_http_req)
-                        .await
-                        .expect("TODO Something with errors here")
-                        .into_response()
-                        .into_parts();
-
-                    let body = match body {
-                        lambda_http::Body::Empty => hyper::Body::empty(),
-                        lambda_http::Body::Text(s) => hyper::Body::from(s),
-                        lambda_http::Body::Binary(v) => hyper::Body::from(v),
-                    };
-
-                    let res: Result<Response<hyper::Body>, hyper::Error> =
-                        Ok(Response::from_parts(parts, body));
-
-                    res
-                }
-            }))
-        }
-    });
-
-    let server = Server::bind(&addr).serve(make);
-
-    // Run the server
-    server.await
+    Server::bind(&addr).serve(make)
 }
 
 #[doc(hidden)]
-pub struct MakeLambdaService<F> {
+pub struct MakeLambdaService<'a, F> {
     factory: F,
+    _phantom: PhantomData<&'a ()>,
 }
 
 // TODO Is the &'t lifetime useful given we don't make use of Target ?
-impl<'a, 't, F, Fut, Svc, R, Target, MkErr> Service<&'t Target> for MakeLambdaService<F>
+impl<'a, 't, F, FFut, Svc, R, Target, MkErr> Service<&'t Target> for MakeLambdaService<'a, F>
 where
-    F: Fn() -> Fut + Send + Clone, // TODO Send and Clone might not be useful
-    Fut: Future<Output = Result<LambdaService<'a, Svc, R>, MkErr>>,
+    F: Fn() -> FFut + Send + Clone, // TODO Send and Clone might not be useful
+    FFut: Future<Output = Result<Svc, MkErr>> + Send,
     Svc: Service<lambda_http::Request, Response = R, Error = lambda_http::Error> + Send,
     Svc::Future: Send + 'a,
     R: lambda_http::IntoResponse,
@@ -88,7 +50,7 @@ where
 {
     type Error = MkErr;
     type Response = LambdaService<'a, Svc, R>;
-    type Future = Fut;
+    type Future = MkSvcFuture<'a, MkErr, FFut, R, Svc>;
 
     fn poll_ready(
         &mut self,
@@ -98,12 +60,42 @@ where
     }
 
     fn call(&mut self, _target: &'t Target) -> Self::Future {
-        (self.factory)()
+        MkSvcFuture(Box::pin(self.factory.clone()()), PhantomData)
+    }
+}
+
+pub struct MkSvcFuture<'a, E, F, R, S>(Pin<Box<F>>, PhantomData<&'a ()>)
+where
+    F: Future<Output = Result<S, E>> + Send,
+    S: Service<lambda_http::Request, Response = R, Error = lambda_http::Error> + Send,
+    S::Future: Send + 'a,
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    R: lambda_http::IntoResponse;
+
+impl<'a, E, F, R, S> Future for MkSvcFuture<'a, E, F, R, S>
+where
+    F: Future<Output = Result<S, E>> + Send,
+    S: Service<lambda_http::Request, Response = R, Error = lambda_http::Error> + Send,
+    S::Future: Send + 'a,
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    R: lambda_http::IntoResponse,
+{
+    type Output = Result<LambdaService<'a, S, R>, E>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext) -> Poll<Self::Output> {
+        match self.0.as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(service)) => Poll::Ready(Ok(LambdaService {
+                service,
+                _phantom_a: PhantomData,
+            })),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+        }
     }
 }
 
 #[doc(hidden)]
-struct LambdaService<'a, S, R>
+pub struct LambdaService<'a, S, R>
 where
     S: tower::Service<lambda_http::Request, Response = R, Error = lambda_http::Error> + Send,
     S::Future: Send + 'a,
@@ -113,7 +105,7 @@ where
     _phantom_a: PhantomData<&'a ()>,
 }
 
-impl<'a, S,R> Service<Request<hyper::Body>> for LambdaService<'a, S, R>
+impl<'a, S, R> Service<Request<hyper::Body>> for LambdaService<'a, S, R>
 where
     S: tower::Service<lambda_http::Request, Response = R, Error = lambda_http::Error> + Send,
     S::Future: Send + 'a,
@@ -137,7 +129,7 @@ where
 }
 
 /// Future that will convert a [`lambda_http::Response`] into a [`hyper::Response`]
-struct TransformResponse<'a, R, E> {
+pub struct TransformResponse<'a, R, E> {
     fut: Pin<Box<dyn Future<Output = Result<R, E>> + Send + 'a>>,
 }
 
